@@ -17,7 +17,7 @@ import torch.nn.functional as F
 warnings.filterwarnings('ignore')
 
 # 设置随机种子和确定性选项
-def set_seed(seed=620):
+def set_seed(seed=42):
     torch.manual_seed(seed)
     np.random.seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -417,23 +417,29 @@ if __name__ == '__main__':
     X_scaled = scaler_X.fit_transform(absorptions)
     y_scaled = scaler_y.fit_transform(parameters)
 
-    # 划分训练集和测试集
+    # 首先分出最终测试集
+    X_temp, X_final_test, y_temp, y_final_test = train_test_split(
+        X_scaled, y_scaled, test_size=0.1, random_state=42
+    )
+    
+    # 然后将剩余数据分为训练集和验证集
     X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y_scaled, test_size=0.2, random_state=42
+        X_temp, y_temp, test_size=0.2, random_state=42
     )
 
-    # 创建数据加载器
+    # 创建数据集
     train_dataset = AbsorptionDataset(X_train, y_train)
-    test_dataset = AbsorptionDataset(X_test, y_test)
-
+    test_dataset = AbsorptionDataset(X_test, y_test)  # 用作验证集
+    final_test_dataset = AbsorptionDataset(X_final_test, y_final_test)  # 真正的测试集
+    
     # 固定超参数
     num_filters = 64
-    kernel_size = 5
+    kernel_size = 7
     dropout_rate = 0.07499385126240433
-    learning_rate = 0.0009249609392561427
+    learning_rate = 0.0009449609392561427
     weight_decay = 3.372482718194792e-04
     n_epochs = 209
-    batch_size = 256
+    batch_size = 64
 
     g = torch.Generator()
     g.manual_seed(42)
@@ -611,3 +617,29 @@ if __name__ == '__main__':
     plt.savefig('loss_curve.png', dpi=300)
     plt.show()
     plt.close()
+
+    # 在最后评估部分添加
+    print("\n=== 最终测试集评估结果 ===")
+    final_test_loader = DataLoader(
+        final_test_dataset, 
+        batch_size=batch_size, 
+        shuffle=False,
+        worker_init_fn=seed_worker,
+        generator=g
+    )
+    
+    print("\n1. 基于验证损失的最佳模型在最终测试集上的表现：")
+    checkpoint = torch.load('best_loss_model.pth')
+    model.load_state_dict(checkpoint['model_state_dict'])
+    final_test_loss, final_test_mae, final_test_r2, final_test_preds, final_test_targets = eval_epoch(
+        model, final_test_loader, criterion, device, split='Final Test'
+    )
+    print(f"Final Test Loss: {final_test_loss:.4f}, MAE: {final_test_mae:.4f}, R2: {final_test_r2:.4f}")
+
+    print("\n2. 基于R²分数的最佳模型在最终测试集上的表现：")
+    checkpoint = torch.load('best_r2_model.pth')
+    model.load_state_dict(checkpoint['model_state_dict'])
+    final_test_loss, final_test_mae, final_test_r2, final_test_preds, final_test_targets = eval_epoch(
+        model, final_test_loader, criterion, device, split='Final Test'
+    )
+    print(f"Final Test Loss: {final_test_loss:.4f}, MAE: {final_test_mae:.4f}, R2: {final_test_r2:.4f}")
