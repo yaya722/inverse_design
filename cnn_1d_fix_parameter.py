@@ -368,7 +368,7 @@ class WarmupReduceLROnPlateau:
     def step(self, metrics=None):
         if self.current_epoch < self.warmup_epochs:
             # 在预热期间线性增加学习率
-            progress = self.current_epoch / self.warmup_epochs
+            progress = (self.current_epoch + 1) / self.warmup_epochs
             lr = self.warmup_start_lr + (self.base_lr - self.warmup_start_lr) * progress
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lr
