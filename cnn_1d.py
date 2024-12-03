@@ -10,7 +10,6 @@ from scipy.io import loadmat
 import matplotlib.pyplot as plt
 import optuna
 import warnings
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm  # 用于进度条显示
 
 # 忽略一些警告信息
@@ -30,20 +29,18 @@ set_seed()
 def load_and_preprocess_data(mat_file_path):
     try:
         data = loadmat(mat_file_path)
-        print("Variables in the .mat file:", data.keys())
-
+        # 添加数据范围检查
         absorptions = np.array(data['absorptions']).squeeze().astype(np.float32)
         parameters = np.array(data['parameters']).squeeze().astype(np.float32)
-
-        print(f'Absorptions shape: {absorptions.shape}')  # 应为 (20000, 601)
-        print(f'Parameters shape: {parameters.shape}')    # 应为 (20000, 5)
-
-        # 检查是否存在NaN或无穷大值
-        if np.any(np.isnan(absorptions)) or np.any(np.isnan(parameters)):
-            raise ValueError("Data contains NaN values")
-        if np.any(np.isinf(absorptions)) or np.any(np.isinf(parameters)):
-            raise ValueError("Data contains infinite values")
-
+        
+        # 添加数据有效性检查
+        if absorptions.size == 0 or parameters.size == 0:
+            raise ValueError("Empty data arrays")
+            
+        # 添加数据一致性检查
+        if len(absorptions) != len(parameters):
+            raise ValueError("Mismatch in number of samples between absorptions and parameters")
+            
         return absorptions, parameters
     except Exception as e:
         print(f"Error loading data: {e}")
@@ -89,28 +86,51 @@ class ResidualBlock(nn.Module):
 class CNN1D(nn.Module):
     def __init__(self, input_channels=1, output_size=5, num_filters=64, kernel_size=5, dropout_rate=0.1, n_features=601):
         super(CNN1D, self).__init__()
+        
+        if n_features <= 0:
+            raise ValueError("n_features must be positive")
+        if kernel_size >= n_features:
+            raise ValueError("kernel_size must be smaller than n_features")
+            
+        # 计算最终特征长度
+        self.final_length = n_features
+        for _ in range(4):  # 减少到4次池化
+            self.final_length = (self.final_length + 1) // 2
+            
+        if self.final_length <= 0:
+            raise ValueError("Input size too small for the current architecture")
+            
+        # 简化网络结构，4组卷积层
         self.layers = nn.Sequential(
+            # 第一层卷积组 (64)
             ResidualBlock(input_channels, num_filters, kernel_size, dropout_rate),
             nn.MaxPool1d(kernel_size=2),
+            
+            # 第二层卷积组 (128)
             ResidualBlock(num_filters, num_filters * 2, kernel_size, dropout_rate),
             nn.MaxPool1d(kernel_size=2),
+            
+            # 第三层卷积组 (256)
             ResidualBlock(num_filters * 2, num_filters * 4, kernel_size, dropout_rate),
             nn.MaxPool1d(kernel_size=2),
+            
+            # 第四层卷积组 (512)
             ResidualBlock(num_filters * 4, num_filters * 8, kernel_size, dropout_rate),
             nn.MaxPool1d(kernel_size=2)
         )
 
+        # 调整全连接层结构
         final_length = n_features // 16  # 4次池化，每次池化kernel_size=2
         self.fc = nn.Sequential(
-            nn.Linear(num_filters * 8 * final_length, 1024),
-            nn.BatchNorm1d(1024),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout_rate),
-            nn.Linear(1024, 512),
+            nn.Linear(num_filters * 8 * final_length, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout_rate),
-            nn.Linear(512, output_size)
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate),
+            nn.Linear(256, output_size)
         )
 
     def forward(self, x):
@@ -119,10 +139,11 @@ class CNN1D(nn.Module):
         return self.fc(x)
 
 # 5. 定义训练和评估函数
-def train_epoch(model, dataloader, criterion, optimizer, device, writer, epoch):
+def train_epoch(model, dataloader, criterion, optimizer, device):
     model.train()
     running_loss = 0.0
     running_mae = 0.0
+    dataset_size = len(dataloader.dataset)
 
     for X_batch, y_batch in tqdm(dataloader, desc="Training", leave=False):
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
@@ -132,19 +153,19 @@ def train_epoch(model, dataloader, criterion, optimizer, device, writer, epoch):
         loss.backward()
         optimizer.step()
 
+        # 使用item()减少GPU内存占用
         running_loss += loss.item() * X_batch.size(0)
-        running_mae += torch.mean(torch.abs(outputs - y_batch)).item() * X_batch.size(0)
+        with torch.no_grad():
+            mae = torch.mean(torch.abs(outputs - y_batch)).item()
+        running_mae += mae * X_batch.size(0)
+        
+        # 清理不需要的张量
+        del outputs, loss
+        torch.cuda.empty_cache()
 
-    epoch_loss = running_loss / len(dataloader.dataset)
-    epoch_mae = running_mae / len(dataloader.dataset)
+    return running_loss / dataset_size, running_mae / dataset_size
 
-    if writer and epoch is not None:
-        writer.add_scalar('Loss/Train', epoch_loss, epoch)
-        writer.add_scalar('MAE/Train', epoch_mae, epoch)
-
-    return epoch_loss, epoch_mae
-
-def eval_epoch(model, dataloader, criterion, device, writer, epoch, split='Validation'):
+def eval_epoch(model, dataloader, criterion, device, split='Validation'):
     model.eval()
     running_loss = 0.0
     running_mae = 0.0
@@ -165,10 +186,6 @@ def eval_epoch(model, dataloader, criterion, device, writer, epoch, split='Valid
     epoch_loss = running_loss / len(dataloader.dataset)
     epoch_mae = running_mae / len(dataloader.dataset)
 
-    if writer and epoch is not None:
-        writer.add_scalar(f'Loss/{split}', epoch_loss, epoch)
-        writer.add_scalar(f'MAE/{split}', epoch_mae, epoch)
-
     return epoch_loss, epoch_mae, np.concatenate(all_preds), np.concatenate(all_targets)
 
 # 设置随机种子
@@ -179,12 +196,12 @@ def seed_worker(worker_id):
 # 6. 定义Optuna的目标函数
 def objective(trial):
     try:
-        num_filters = trial.suggest_categorical('num_filters', [32, 64, 128])
-        kernel_size = trial.suggest_int('kernel_size', 3, 7, step=2)
-        dropout_rate = trial.suggest_uniform('dropout_rate', 0.0, 0.3)
-        learning_rate = trial.suggest_loguniform('learning_rate', 1e-4, 1e-2)
-        weight_decay = trial.suggest_loguniform('weight_decay', 1e-6, 1e-4)
-        n_epochs = trial.suggest_int('n_epochs', 100, 300)
+        num_filters = trial.suggest_categorical('num_filters', [16, 32, 64, 128])
+        kernel_size = trial.suggest_int('kernel_size', 3, 9, step=2)
+        dropout_rate = trial.suggest_float('dropout_rate', 0.1, 0.3)
+        learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True)
+        weight_decay = trial.suggest_float('weight_decay', 1e-5, 1e-3, log=True)
+        n_epochs = trial.suggest_int('n_epochs', 50, 250)
         batch_size = trial.suggest_categorical('batch_size', [32, 64, 128, 256])
 
         kf = KFold(n_splits=5, shuffle=True, random_state=42)
@@ -202,11 +219,29 @@ def objective(trial):
             y_train_cv = scaler_y.fit_transform(y_train_cv)
             y_val_cv = scaler_y.transform(y_val_cv)
 
-            train_loader = DataLoader(AbsorptionDataset(X_train_cv, y_train_cv), batch_size=batch_size, shuffle=True, worker_init_fn=seed_worker)
-            val_loader = DataLoader(AbsorptionDataset(X_val_cv, y_val_cv), batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
+            train_loader = DataLoader(
+                AbsorptionDataset(X_train_cv, y_train_cv),
+                batch_size=batch_size,
+                shuffle=True,
+                worker_init_fn=seed_worker,
+                num_workers=2  # 可以根据你的系统调整
+            )
+            val_loader = DataLoader(
+                AbsorptionDataset(X_val_cv, y_val_cv),
+                batch_size=batch_size,
+                shuffle=False,
+                worker_init_fn=seed_worker,
+                num_workers=2
+            )
 
-            model = CNN1D(input_channels=1, output_size=y.shape[1], num_filters=num_filters,
-                           kernel_size=kernel_size, dropout_rate=dropout_rate, n_features=X_train_cv.shape[1]).to(device)
+            model = CNN1D(
+                input_channels=1,
+                output_size=y.shape[1],
+                num_filters=num_filters,
+                kernel_size=kernel_size,
+                dropout_rate=dropout_rate,
+                n_features=X_train_cv.shape[1]
+            ).to(device)
 
             criterion = nn.MSELoss()
             optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -217,8 +252,8 @@ def objective(trial):
             patience = 30  # 增加早停耐心
 
             for epoch in range(n_epochs):
-                train_loss, train_mae = train_epoch(model, train_loader, criterion, optimizer, device, None, None)
-                val_loss, val_mae, _, _ = eval_epoch(model, val_loader, criterion, device, None, None)
+                train_loss, train_mae = train_epoch(model, train_loader, criterion, optimizer, device)
+                val_loss, val_mae, _, _ = eval_epoch(model, val_loader, criterion, device)
 
                 scheduler.step()
 
@@ -260,8 +295,12 @@ if __name__ == '__main__':
     for key, value in trial.params.items():
         print(f"    {key}: {value}")
 
-    best_params = {param: trial.params[param] for param in ['num_filters', 'kernel_size', 'dropout_rate', 'learning_rate', 'weight_decay', 'n_epochs', 'batch_size']}
+    best_params = {
+        param: trial.params[param] 
+        for param in ['num_filters', 'kernel_size', 'dropout_rate', 'learning_rate', 'weight_decay', 'n_epochs', 'batch_size']
+    }
 
+    # 分割数据为训练集和测试集
     X_train_full, X_test, y_train_full, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
     scaler_X = StandardScaler()
@@ -272,62 +311,152 @@ if __name__ == '__main__':
     y_train = scaler_y.fit_transform(y_train_full)
     y_test = scaler_y.transform(y_test)
 
-    train_loader = DataLoader(AbsorptionDataset(X_train_full, y_train), batch_size=best_params['batch_size'], shuffle=True, worker_init_fn=seed_worker)
-    test_loader = DataLoader(AbsorptionDataset(X_test, y_test), batch_size=best_params['batch_size'], shuffle=False, worker_init_fn=seed_worker)
+    train_loader = DataLoader(
+        AbsorptionDataset(X_train_full, y_train),
+        batch_size=best_params['batch_size'],
+        shuffle=True,
+        worker_init_fn=seed_worker,
+        num_workers=2
+    )
+    test_loader = DataLoader(
+        AbsorptionDataset(X_test, y_test),
+        batch_size=best_params['batch_size'],
+        shuffle=False,
+        worker_init_fn=seed_worker,
+        num_workers=2
+    )
 
+    # 分割训练集为训练部分和验证部分
     X_train_part, X_val, y_train_part, y_val = train_test_split(X_train_full, y_train, test_size=0.1, random_state=42)
-    train_part_loader = DataLoader(AbsorptionDataset(X_train_part, y_train_part), batch_size=best_params['batch_size'], shuffle=True, worker_init_fn=seed_worker)
-    val_final_loader = DataLoader(AbsorptionDataset(X_val, y_val), batch_size=best_params['batch_size'], shuffle=False, worker_init_fn=seed_worker)
+    train_part_loader = DataLoader(
+        AbsorptionDataset(X_train_part, y_train_part),
+        batch_size=best_params['batch_size'],
+        shuffle=True,
+        worker_init_fn=seed_worker,
+        num_workers=2
+    )
+    val_final_loader = DataLoader(
+        AbsorptionDataset(X_val, y_val),
+        batch_size=best_params['batch_size'],
+        shuffle=False,
+        worker_init_fn=seed_worker,
+        num_workers=2
+    )
 
-    writer = SummaryWriter('runs/CNN1D_experiment')
-    model = CNN1D(input_channels=1, output_size=y.shape[1], num_filters=best_params['num_filters'],
-                   kernel_size=best_params['kernel_size'], dropout_rate=best_params['dropout_rate'],
-                   n_features=X_train_full.shape[1]).to(device)
+    # 初始化模型
+    model = CNN1D(
+        input_channels=1,
+        output_size=y.shape[1],
+        num_filters=best_params['num_filters'],
+        kernel_size=best_params['kernel_size'],
+        dropout_rate=best_params['dropout_rate'],
+        n_features=X_train_full.shape[1]
+    ).to(device)
 
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=best_params['learning_rate'], weight_decay=best_params['weight_decay'])
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=best_params['learning_rate'],
+        weight_decay=best_params['weight_decay']
+    )
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,
+        patience=10,
+        verbose=True,
+        min_lr=1e-6  # 添加最小学习率限制
+    )
 
-    best_val_loss = np.inf
+    # 在主训练循环之前初始化列表
+    best_val_loss = float('inf')
     epochs_no_improve = 0
+    early_stopping_patience = 30
+    min_delta = 1e-6
+    train_losses = []  # 添加这行
+    val_losses_history = []  # 添加这行
 
     for epoch in range(best_params['n_epochs']):
+        train_loss, train_mae = train_epoch(model, train_part_loader, criterion, optimizer, device)
+        val_loss, val_mae, _, _ = eval_epoch(model, val_final_loader, criterion, device)
+        
+        # 记录损失值
+        train_losses.append(train_loss)  # 添加训练损失
+        val_losses_history.append(val_loss)  # 添加验证损失
+        
         print(f"\nEpoch {epoch+1}/{best_params['n_epochs']}")
-        train_loss, train_mae = train_epoch(model, train_part_loader, criterion, optimizer, device, writer, epoch)
-        val_loss, val_mae, _, _ = eval_epoch(model, val_final_loader, criterion, device, writer, epoch)
-
         print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-
+        
         scheduler.step(val_loss)
-
-        if val_loss < best_val_loss:
+        
+        # 改进的早停逻辑
+        if val_loss < (best_val_loss - min_delta):
             best_val_loss = val_loss
             epochs_no_improve = 0
-            torch.save(model.state_dict(), 'best_cnn_model.pth')
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': val_loss,
+                'train_losses': train_losses,  # 保存训练历史
+                'val_losses': val_losses_history,  # 保存验证历史
+            }, 'best_cnn_model.pth')
         else:
             epochs_no_improve += 1
-            if epochs_no_improve >= 30:  # 提前停止
-                print('Early stopping triggered!')
+            if epochs_no_improve >= early_stopping_patience:
+                print(f'Early stopping triggered at epoch {epoch}')
                 break
 
-    model.load_state_dict(torch.load('best_cnn_model.pth'))
+    # 加载最佳模型
+    model.load_state_dict(torch.load('best_cnn_model.pth')['model_state_dict'])
     model.eval()
 
-    test_loss, test_mae, test_preds, test_targets = eval_epoch(model, test_loader, criterion, device, writer, epoch, split='Test')
+    # 在测试集上评估
+    test_loss, test_mae, test_preds, test_targets = eval_epoch(model, test_loader, criterion, device, split='Test')
     print(f"\nTest Loss: {test_loss:.4f} | Test MAE: {test_mae:.4f}")
 
+    # 反标准化预测值和真实值
     y_pred = scaler_y.inverse_transform(test_preds)
     y_true = scaler_y.inverse_transform(test_targets)
 
-    plt.figure(figsize=(18, 6))
-    plt.subplot(1, 3, 1)
-    plt.plot(val_final_loader.dataset.y.cpu().numpy(), label='True')
-    plt.plot(test_preds, label='Predicted')
-    plt.xlabel('Samples')
-    plt.ylabel('Values')
-    plt.title('True vs Predicted Values')
-    plt.legend()
+    # 确保 y_true 和 y_pred 的形状相同
+    assert y_true.shape == y_pred.shape, "y_true 和 y_pred 的形状不一致"
+
+    # 计算并输出每个输出变量的 R² 分数
+    print("\n各输出变量的 R² 分数：")
+    for i in range(y_true.shape[1]):
+        r2 = r2_score(y_true[:, i], y_pred[:, i])
+        print(f"输出 {i+1} 的 R² 分数: {r2:.4f}")
+
+    # 计算总体 R² 分数
+    overall_r2 = r2_score(y_true, y_pred)
+    print(f"\n总体 R² 分数: {overall_r2:.4f}")
+
+    # 绘制真实值与预测值
+    num_outputs = y_true.shape[1]
+    plt.figure(figsize=(18, 6 * num_outputs))  # 动态调整高度
+
+    for i in range(num_outputs):
+        plt.subplot(num_outputs, 1, i + 1)
+        plt.plot(y_true[:, i], label=f'True Values - Output {i+1}', alpha=0.7)
+        plt.plot(y_pred[:, i], label=f'Predicted Values - Output {i+1}', alpha=0.7)
+        plt.xlabel('Samples')
+        plt.ylabel('Value')
+        plt.title(f'True vs Predicted Values for Output {i+1}')
+        plt.legend()
+
+    plt.tight_layout()
     plt.savefig('training_metrics.png', dpi=300)
     plt.show()
 
-    plt.close(writer)  # 关闭TensorBoard
+    # 绘制训练和验证损失曲线
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(val_losses_history, label='Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss')
+    plt.legend()
+    plt.savefig('loss_curve.png', dpi=300)
+    plt.show()
+    plt.close()
