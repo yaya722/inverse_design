@@ -83,10 +83,6 @@ This project is licensed under the MIT License. See the `LICENSE` file for more 
 - Thanks to the open-source community for providing great resources to build upon.
 - Special thanks to all contributors and users who provide feedback to improve these scripts.
 
-## Contact
-
-For any questions, please open an issue or reach out via email at 2601145259@qq.com.
-
 ---
 Enjoy experimenting and happy coding!
 
